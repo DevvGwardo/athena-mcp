@@ -5,8 +5,14 @@
  * Inspired by Codebuff's thinker agent (agents/thinker/thinker.ts):
  * a specialized agent with NO tools whose job is to reason deeply about a
  * problem and return a concise response. The tool-using agent (Hermes, Claude,
- * etc.) keeps orchestration; the thinker contributes pure reasoning via a
- * stronger model than the caller would normally use inline.
+ * etc.) keeps orchestration; the thinker contributes pure reasoning.
+ *
+ * Two backends:
+ *   - `claude-code` — spawns `claude -p` and uses the user's Anthropic
+ *     subscription (Pro/Max) OAuth. No per-token billing, just counts against
+ *     subscription usage. Supports `opus` / `sonnet` / `haiku` models.
+ *   - `openrouter` — HTTPS call to OpenRouter. Any model (Claude, GPT, Gemini,
+ *     DeepSeek, etc.) via per-token billing.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -15,14 +21,44 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
-const DEFAULT_MODEL = process.env.THINKER_MODEL ?? 'anthropic/claude-opus-4.6';
-const DEFAULT_EFFORT = (process.env.THINKER_REASONING_EFFORT ?? 'high') as
-  | 'low'
-  | 'medium'
-  | 'high';
+type Backend = 'claude-code' | 'openrouter';
+type Effort = 'low' | 'medium' | 'high';
+
+function detectBackend(): Backend {
+  const explicit = process.env.THINKER_BACKEND?.trim().toLowerCase();
+  if (explicit === 'claude-code' || explicit === 'openrouter') return explicit;
+  // Default: prefer claude-code if the CLI is reachable, else fall back to openrouter.
+  return claudeCliPath() ? 'claude-code' : 'openrouter';
+}
+
+function claudeCliPath(): string | null {
+  // Only check PATH entries; never shell out to `which` here to avoid a spawn
+  // on every server startup. PATH resolution is good enough.
+  const override = process.env.THINKER_CLAUDE_CLI;
+  if (override && existsSync(override)) return override;
+  const path = process.env.PATH ?? '';
+  for (const dir of path.split(':').filter(Boolean)) {
+    const candidate = `${dir}/claude`;
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+const BACKEND: Backend = detectBackend();
+const DEFAULT_EFFORT: Effort = (process.env.THINKER_REASONING_EFFORT ?? 'high') as Effort;
+const DEFAULT_MODEL =
+  process.env.THINKER_MODEL ??
+  (BACKEND === 'claude-code' ? 'opus' : 'anthropic/claude-opus-4.6');
+
 const APP_NAME = process.env.THINKER_APP_NAME ?? 'thinker-mcp';
 const APP_URL = process.env.THINKER_APP_URL ?? 'https://github.com/devgwardo/thinker-mcp';
+
+// Timeout for claude-code subprocess calls.
+const CLAUDE_TIMEOUT_MS = Number(process.env.THINKER_TIMEOUT_MS ?? 180_000);
 
 const SYSTEM_PROMPT = `You are a thinker agent. You have no tools — your sole job is to reason.
 
@@ -35,21 +71,122 @@ If the caller gave you <context>, read it carefully before reasoning. If the con
 interface ThinkArgs {
   prompt: string;
   context?: string;
-  effort?: 'low' | 'medium' | 'high';
+  effort?: Effort;
   model?: string;
 }
 
-interface OpenRouterMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
+// ---------------------------------------------------------------------------
+// claude-code backend
+// ---------------------------------------------------------------------------
+
+interface ClaudeJsonResult {
+  type?: string;
+  subtype?: string;
+  is_error?: boolean;
+  result?: string;
+  duration_ms?: number;
+  duration_api_ms?: number;
+  total_cost_usd?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
+  modelUsage?: Record<string, unknown>;
 }
+
+async function thinkViaClaudeCode(args: ThinkArgs, userContent: string): Promise<string> {
+  const cli = claudeCliPath();
+  if (!cli) {
+    throw new Error(
+      'claude CLI not found on PATH. Install Claude Code or set THINKER_BACKEND=openrouter.'
+    );
+  }
+
+  const model = args.model ?? DEFAULT_MODEL;
+  const effort = args.effort ?? DEFAULT_EFFORT;
+
+  const cliArgs = [
+    '-p',
+    '--tools', '',
+    '--disable-slash-commands',
+    '--no-session-persistence',
+    '--output-format', 'json',
+    '--setting-sources', 'user',
+    '--model', model,
+    '--effort', effort,
+    '--system-prompt', SYSTEM_PROMPT,
+    userContent,
+  ];
+
+  // Run from a neutral cwd so project-level CLAUDE.md files don't leak into
+  // the thinker's context.
+  const cwd = tmpdir();
+
+  const stdout = await new Promise<string>((resolve, reject) => {
+    const child = spawn(cli, cliArgs, {
+      cwd,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let out = '';
+    let err = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`claude -p timed out after ${CLAUDE_TIMEOUT_MS}ms`));
+    }, CLAUDE_TIMEOUT_MS);
+
+    child.stdout.on('data', (c) => { out += c.toString(); });
+    child.stderr.on('data', (c) => { err += c.toString(); });
+
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      reject(new Error(`claude spawn failed: ${e.message}`));
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`claude -p exited ${code}: ${err.trim() || out.trim() || '(no output)'}`));
+        return;
+      }
+      resolve(out);
+    });
+  });
+
+  let parsed: ClaudeJsonResult;
+  try {
+    parsed = JSON.parse(stdout.trim());
+  } catch {
+    throw new Error(`claude -p returned non-JSON output: ${stdout.slice(0, 500)}`);
+  }
+
+  if (parsed.is_error) {
+    throw new Error(`claude -p reported error: ${parsed.result ?? '(no message)'}`);
+  }
+
+  const rawResult = parsed.result ?? '';
+  const cleaned = rawResult.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+  const usage = parsed.usage;
+  const duration = parsed.duration_ms ? `${(parsed.duration_ms / 1000).toFixed(1)}s` : '?';
+  const tokenInfo = usage
+    ? ` · ${usage.input_tokens ?? '?'} in / ${usage.output_tokens ?? '?'} out`
+    : '';
+
+  return `${cleaned}\n\n---\n_backend: claude-code (subscription) · model: ${model} · effort: ${effort} · ${duration}${tokenInfo}_`;
+}
+
+// ---------------------------------------------------------------------------
+// openrouter backend
+// ---------------------------------------------------------------------------
 
 interface OpenRouterResponse {
   choices?: Array<{
     message?: {
       content?: string | null;
       reasoning?: string | null;
-      reasoning_details?: unknown;
     };
     finish_reason?: string;
   }>;
@@ -63,32 +200,24 @@ interface OpenRouterResponse {
   model?: string;
 }
 
-async function think(args: ThinkArgs): Promise<string> {
+async function thinkViaOpenRouter(args: ThinkArgs, userContent: string): Promise<string> {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
     throw new Error(
-      'OPENROUTER_API_KEY is not set. Export it in the Hermes environment or set it in your MCP server config.'
+      'OPENROUTER_API_KEY is not set. Either export it, or set THINKER_BACKEND=claude-code.'
     );
   }
 
   const model = args.model ?? DEFAULT_MODEL;
   const effort = args.effort ?? DEFAULT_EFFORT;
 
-  const userContent = args.context
-    ? `<context>\n${args.context}\n</context>\n\n<prompt>\n${args.prompt}\n</prompt>`
-    : args.prompt;
-
-  const messages: OpenRouterMessage[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user', content: userContent },
-  ];
-
   const body = {
     model,
-    messages,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: userContent },
+    ],
     reasoning: { effort },
-    // Explicitly ask OpenRouter to stream reasoning traces back in the response
-    // so the caller can see the thinking if the model surfaces it.
     include_reasoning: true,
   };
 
@@ -116,28 +245,42 @@ async function think(args: ThinkArgs): Promise<string> {
   const choice = data.choices?.[0];
   const rawContent = choice?.message?.content ?? '';
   const reasoning = choice?.message?.reasoning ?? '';
-
-  // Strip <think>...</think> blocks the way Codebuff's thinker does.
   const cleaned = rawContent.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 
   const usage = data.usage;
-  const usageLine = usage
-    ? `\n\n---\n_model: ${data.model ?? model} · tokens: ${usage.prompt_tokens ?? '?'} in / ${usage.completion_tokens ?? '?'} out${usage.reasoning_tokens ? ` (${usage.reasoning_tokens} reasoning)` : ''}_`
-    : `\n\n---\n_model: ${data.model ?? model}_`;
-
-  // If the model returned separate reasoning content, include a brief note that
-  // it's available but don't dump it by default — the caller asked for a concise
-  // answer. They can ask for reasoning explicitly by passing a prompt that
-  // requests it.
-  const reasoningHint = reasoning
-    ? `\n_(${reasoning.length} chars of reasoning trace suppressed)_`
+  const tokenInfo = usage
+    ? ` · ${usage.prompt_tokens ?? '?'} in / ${usage.completion_tokens ?? '?'} out${usage.reasoning_tokens ? ` (${usage.reasoning_tokens} reasoning)` : ''}`
     : '';
+  const reasoningHint = reasoning ? `\n_(${reasoning.length} chars of reasoning trace suppressed)_` : '';
 
-  return `${cleaned}${reasoningHint}${usageLine}`;
+  return `${cleaned}${reasoningHint}\n\n---\n_backend: openrouter · model: ${data.model ?? model} · effort: ${effort}${tokenInfo}_`;
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+async function think(args: ThinkArgs): Promise<string> {
+  const userContent = args.context
+    ? `<context>\n${args.context}\n</context>\n\n<prompt>\n${args.prompt}\n</prompt>`
+    : args.prompt;
+
+  return BACKEND === 'claude-code'
+    ? thinkViaClaudeCode(args, userContent)
+    : thinkViaOpenRouter(args, userContent);
+}
+
+// ---------------------------------------------------------------------------
+// MCP server
+// ---------------------------------------------------------------------------
+
+const modelExamples =
+  BACKEND === 'claude-code'
+    ? 'opus, sonnet, haiku, or full Claude model names like claude-opus-4-6'
+    : 'anthropic/claude-opus-4.6, openai/gpt-5.4, google/gemini-3.1-pro-preview, deepseek/deepseek-r1';
+
 const server = new Server(
-  { name: 'thinker-mcp', version: '0.1.0' },
+  { name: 'thinker-mcp', version: '0.2.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -146,7 +289,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'think',
       description:
-        'Delegate deep reasoning to a stronger model. Use this when you hit a hard problem that benefits from careful step-by-step thought: architecture decisions, subtle bugs, plan critique, tricky logic. The thinker has NO tools — it only reasons and returns a concise response. You must gather any relevant context yourself and pass it in. Does not modify files, run commands, or access the network beyond the reasoning call. Costs tokens on the configured reasoning model.',
+        'Delegate deep reasoning to a stronger model. Use this when you hit a hard problem that benefits from careful step-by-step thought: architecture decisions, subtle bugs, plan critique, tricky logic. The thinker has NO tools — it only reasons and returns a concise response. You must gather any relevant context yourself and pass it in via the `context` arg. Does not modify files, run commands, or access the network beyond the reasoning call.',
       inputSchema: {
         type: 'object',
         required: ['prompt'],
@@ -168,7 +311,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           model: {
             type: 'string',
-            description: `Optional OpenRouter model id override. Defaults to ${DEFAULT_MODEL}. Examples: anthropic/claude-opus-4.6, openai/gpt-5.4, google/gemini-3.1-pro-preview, deepseek/deepseek-r1.`,
+            description: `Optional model override. Defaults to ${DEFAULT_MODEL}. Accepted values for current backend (${BACKEND}): ${modelExamples}.`,
           },
         },
       },
@@ -206,13 +349,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  // Log to stderr so stdout stays a clean MCP channel.
   process.stderr.write(
-    `thinker-mcp ready · default model: ${DEFAULT_MODEL} · effort: ${DEFAULT_EFFORT}\n`
+    `thinker-mcp ready · backend: ${BACKEND} · model: ${DEFAULT_MODEL} · effort: ${DEFAULT_EFFORT}\n`
   );
 }
 
 main().catch((err) => {
-  process.stderr.write(`thinker-mcp fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+  process.stderr.write(
+    `thinker-mcp fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`
+  );
   process.exit(1);
 });

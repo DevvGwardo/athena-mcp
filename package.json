@@ -1,6 +1,6 @@
 {
   "name": "thinker-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server exposing a `think` tool — pure reasoning with no side effects, modeled after Codebuff's thinker agent. Lets a tool-using agent (e.g. Hermes) delegate hard reasoning to a stronger model via OpenRouter.",
   "type": "module",
   "main": "dist/index.js",

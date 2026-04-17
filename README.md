@@ -19,47 +19,56 @@ npm install
 npm run build
 ```
 
-Set your API key (get one at https://openrouter.ai/keys):
+## Two backends
 
-```bash
-export OPENROUTER_API_KEY=sk-or-v1-...
-```
+**`claude-code` (default when the `claude` CLI is on PATH)** — spawns `claude -p` for each call and uses your Anthropic Pro/Max subscription's OAuth. No API key required; usage counts against your subscription quota instead of per-token billing. Supports `opus`, `sonnet`, `haiku`, or full Claude model names.
 
-Optional env vars:
+**`openrouter`** — HTTPS call to OpenRouter. Any model (Claude via API, GPT, Gemini, DeepSeek, etc.) via per-token billing. Requires `OPENROUTER_API_KEY`.
 
-- `THINKER_MODEL` — default OpenRouter model id. Defaults to `anthropic/claude-opus-4.6`. Other good reasoning choices: `openai/gpt-5.4`, `google/gemini-3.1-pro-preview`, `deepseek/deepseek-r1`.
-- `THINKER_REASONING_EFFORT` — `low` | `medium` | `high`. Defaults to `high`.
-- `THINKER_APP_NAME`, `THINKER_APP_URL` — OpenRouter analytics headers.
+Pick explicitly with `THINKER_BACKEND=claude-code` or `THINKER_BACKEND=openrouter`.
+
+## Env vars
+
+| Var | Backend | Default | Notes |
+|---|---|---|---|
+| `THINKER_BACKEND` | both | auto | `claude-code` if `claude` CLI found, else `openrouter` |
+| `THINKER_MODEL` | both | `opus` (claude-code) / `anthropic/claude-opus-4.6` (openrouter) | Model to use |
+| `THINKER_REASONING_EFFORT` | both | `high` | `low` / `medium` / `high` |
+| `THINKER_CLAUDE_CLI` | claude-code | auto (PATH lookup) | Absolute path to `claude` binary |
+| `THINKER_TIMEOUT_MS` | claude-code | 180000 | Subprocess timeout |
+| `OPENROUTER_API_KEY` | openrouter | — | Required for openrouter backend |
+| `THINKER_APP_NAME`, `THINKER_APP_URL` | openrouter | — | OpenRouter analytics headers |
 
 ## Register with Hermes
 
-Hermes already speaks MCP over stdio. Two options:
+Hermes speaks MCP over stdio natively. Use the CLI:
 
-**Option 1: CLI**
-
-```bash
-hermes mcp add thinker --command node --args /Users/YOU/projects/thinker-mcp/dist/index.js --env OPENROUTER_API_KEY=sk-or-v1-...
-```
-
-**Option 2: Edit `~/.hermes/config.yaml`**
-
-Append the absolute path under `mcp_servers`:
-
-```yaml
-mcp_servers:
-  - /Users/YOU/brain-mcp/dist/index.js
-  - /Users/YOU/projects/thinker-mcp/dist/index.js
-```
-
-Make sure `OPENROUTER_API_KEY` is in the environment Hermes runs under.
-
-Verify Hermes sees the tool:
+**claude-code backend (subscription):**
 
 ```bash
-hermes mcp list
+hermes mcp add thinker \
+  --command /path/to/node \
+  --args /Users/YOU/projects/thinker-mcp/dist/index.js \
+  --env THINKER_CLAUDE_CLI=/opt/homebrew/bin/claude
 ```
 
-You should see `thinker` in the output with `think` as an available tool.
+**openrouter backend (API):**
+
+```bash
+hermes mcp add thinker \
+  --command /path/to/node \
+  --args /Users/YOU/projects/thinker-mcp/dist/index.js \
+  --env THINKER_BACKEND=openrouter OPENROUTER_API_KEY=sk-or-v1-... THINKER_MODEL=anthropic/claude-opus-4.6
+```
+
+Verify:
+
+```bash
+hermes mcp list       # should show `thinker`
+hermes mcp test thinker  # should report "✓ Connected" and discover 1 tool
+```
+
+Restart Hermes (or start a new session) to make the tool available to the agent.
 
 ## Use it from any MCP client
 
