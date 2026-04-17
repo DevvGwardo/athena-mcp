@@ -1,12 +1,34 @@
 {
-  "name": "thinker-mcp",
-  "version": "0.2.0",
-  "description": "MCP server exposing a `think` tool — pure reasoning with no side effects, modeled after Codebuff's thinker agent. Lets a tool-using agent (e.g. Hermes) delegate hard reasoning to a stronger model via OpenRouter.",
+  "name": "athena-mcp",
+  "version": "0.3.0",
+  "description": "When Hermes is stuck, it asks Athena. An MCP server exposing a single `think` tool — a no-tools reasoning sidekick your agent can call when it needs a stronger brain. Backed by your Claude Pro/Max subscription or any OpenRouter model.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "hermes",
+    "hermes-agent",
+    "claude",
+    "claude-code",
+    "reasoning",
+    "thinker",
+    "athena",
+    "anthropic",
+    "openrouter"
+  ],
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "thinker-mcp": "dist/index.js"
+    "athena-mcp": "dist/index.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DevvGwardo/athena-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DevvGwardo/athena-mcp/issues"
+  },
+  "homepage": "https://github.com/DevvGwardo/athena-mcp#readme",
+  "license": "MIT",
   "engines": {
     "node": ">=18"
   },

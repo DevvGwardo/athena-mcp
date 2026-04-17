@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /**
- * thinker-mcp — an MCP server exposing a single `think` tool.
+ * athena-mcp — when Hermes is stuck, it asks Athena.
  *
- * Inspired by Codebuff's thinker agent (agents/thinker/thinker.ts):
- * a specialized agent with NO tools whose job is to reason deeply about a
- * problem and return a concise response. The tool-using agent (Hermes, Claude,
- * etc.) keeps orchestration; the thinker contributes pure reasoning.
+ * An MCP server exposing a single `think` tool: a no-tools reasoning sidekick
+ * your agent can call when it needs a stronger brain. Inspired by Codebuff's
+ * thinker agent (agents/thinker/thinker.ts) — the tool-using caller (Hermes,
+ * Claude, Cursor, etc.) keeps orchestration; Athena contributes pure thought
+ * and returns a concise response.
  *
  * Two backends:
  *   - `claude-code` — spawns `claude -p` and uses the user's Anthropic
@@ -29,7 +30,7 @@ type Backend = 'claude-code' | 'openrouter';
 type Effort = 'low' | 'medium' | 'high';
 
 function detectBackend(): Backend {
-  const explicit = process.env.THINKER_BACKEND?.trim().toLowerCase();
+  const explicit = process.env.ATHENA_BACKEND?.trim().toLowerCase();
   if (explicit === 'claude-code' || explicit === 'openrouter') return explicit;
   // Default: prefer claude-code if the CLI is reachable, else fall back to openrouter.
   return claudeCliPath() ? 'claude-code' : 'openrouter';
@@ -38,7 +39,7 @@ function detectBackend(): Backend {
 function claudeCliPath(): string | null {
   // Only check PATH entries; never shell out to `which` here to avoid a spawn
   // on every server startup. PATH resolution is good enough.
-  const override = process.env.THINKER_CLAUDE_CLI;
+  const override = process.env.ATHENA_CLAUDE_CLI;
   if (override && existsSync(override)) return override;
   const path = process.env.PATH ?? '';
   for (const dir of path.split(':').filter(Boolean)) {
@@ -49,16 +50,16 @@ function claudeCliPath(): string | null {
 }
 
 const BACKEND: Backend = detectBackend();
-const DEFAULT_EFFORT: Effort = (process.env.THINKER_REASONING_EFFORT ?? 'high') as Effort;
+const DEFAULT_EFFORT: Effort = (process.env.ATHENA_EFFORT ?? 'high') as Effort;
 const DEFAULT_MODEL =
-  process.env.THINKER_MODEL ??
+  process.env.ATHENA_MODEL ??
   (BACKEND === 'claude-code' ? 'opus' : 'anthropic/claude-opus-4.6');
 
-const APP_NAME = process.env.THINKER_APP_NAME ?? 'thinker-mcp';
-const APP_URL = process.env.THINKER_APP_URL ?? 'https://github.com/devgwardo/thinker-mcp';
+const APP_NAME = process.env.ATHENA_APP_NAME ?? 'athena-mcp';
+const APP_URL = process.env.ATHENA_APP_URL ?? 'https://github.com/DevvGwardo/athena-mcp';
 
 // Timeout for claude-code subprocess calls.
-const CLAUDE_TIMEOUT_MS = Number(process.env.THINKER_TIMEOUT_MS ?? 180_000);
+const CLAUDE_TIMEOUT_MS = Number(process.env.ATHENA_TIMEOUT_MS ?? 180_000);
 
 const SYSTEM_PROMPT = `You are a thinker agent. You have no tools — your sole job is to reason.
 
@@ -100,7 +101,7 @@ async function thinkViaClaudeCode(args: ThinkArgs, userContent: string): Promise
   const cli = claudeCliPath();
   if (!cli) {
     throw new Error(
-      'claude CLI not found on PATH. Install Claude Code or set THINKER_BACKEND=openrouter.'
+      'claude CLI not found on PATH. Install Claude Code or set ATHENA_BACKEND=openrouter.'
     );
   }
 
@@ -121,7 +122,7 @@ async function thinkViaClaudeCode(args: ThinkArgs, userContent: string): Promise
   ];
 
   // Run from a neutral cwd so project-level CLAUDE.md files don't leak into
-  // the thinker's context.
+  // Athena's context.
   const cwd = tmpdir();
 
   const stdout = await new Promise<string>((resolve, reject) => {
@@ -204,7 +205,7 @@ async function thinkViaOpenRouter(args: ThinkArgs, userContent: string): Promise
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
     throw new Error(
-      'OPENROUTER_API_KEY is not set. Either export it, or set THINKER_BACKEND=claude-code.'
+      'OPENROUTER_API_KEY is not set. Either export it, or set ATHENA_BACKEND=claude-code.'
     );
   }
 
@@ -280,7 +281,7 @@ const modelExamples =
     : 'anthropic/claude-opus-4.6, openai/gpt-5.4, google/gemini-3.1-pro-preview, deepseek/deepseek-r1';
 
 const server = new Server(
-  { name: 'thinker-mcp', version: '0.2.0' },
+  { name: 'athena-mcp', version: '0.3.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -289,7 +290,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'think',
       description:
-        'Delegate deep reasoning to a stronger model. Use this when you hit a hard problem that benefits from careful step-by-step thought: architecture decisions, subtle bugs, plan critique, tricky logic. The thinker has NO tools — it only reasons and returns a concise response. You must gather any relevant context yourself and pass it in via the `context` arg. Does not modify files, run commands, or access the network beyond the reasoning call.',
+        'Ask Athena to think. Delegates deep reasoning to a stronger model when you hit a hard problem — architecture decisions, subtle bugs, plan critique, tricky logic. Athena has NO tools; she only reasons and returns a concise response. You must gather relevant context yourself and pass it in via the `context` arg. Does not modify files, run commands, or access the network beyond the reasoning call.',
       inputSchema: {
         type: 'object',
         required: ['prompt'],
@@ -297,12 +298,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           prompt: {
             type: 'string',
             description:
-              'The problem to think about. Can be brief — the thinker will reason about it carefully. Example: "Is this race condition in the claim() function real, and if so what\'s the minimal fix?"',
+              'The problem to think about. Can be brief — Athena will reason about it carefully. Example: "Is this race condition in the claim() function real, and if so what\'s the minimal fix?"',
           },
           context: {
             type: 'string',
             description:
-              'Optional. Relevant code, conversation excerpts, error messages, or other material the thinker needs. The thinker cannot read files, so anything it needs to see must be pasted here.',
+              'Optional. Relevant code, conversation excerpts, error messages, or other material Athena needs. Athena cannot read files, so anything it needs to see must be pasted here.',
           },
           effort: {
             type: 'string',
@@ -341,7 +342,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const message = err instanceof Error ? err.message : String(err);
     return {
       isError: true,
-      content: [{ type: 'text', text: `thinker-mcp error: ${message}` }],
+      content: [{ type: 'text', text: `athena-mcp error: ${message}` }],
     };
   }
 });
@@ -350,13 +351,13 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write(
-    `thinker-mcp ready · backend: ${BACKEND} · model: ${DEFAULT_MODEL} · effort: ${DEFAULT_EFFORT}\n`
+    `athena-mcp ready · backend: ${BACKEND} · model: ${DEFAULT_MODEL} · effort: ${DEFAULT_EFFORT}\n`
   );
 }
 
 main().catch((err) => {
   process.stderr.write(
-    `thinker-mcp fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`
+    `athena-mcp fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`
   );
   process.exit(1);
 });
