@@ -29,6 +29,11 @@ import { tmpdir } from 'node:os';
 type Backend = 'claude-code' | 'openrouter';
 type Effort = 'low' | 'medium' | 'high';
 
+const EFFORTS = ['low', 'medium', 'high'] as const;
+function isEffort(v: unknown): v is Effort {
+  return typeof v === 'string' && (EFFORTS as readonly string[]).includes(v);
+}
+
 function detectBackend(): Backend {
   const explicit = process.env.ATHENA_BACKEND?.trim().toLowerCase();
   if (explicit === 'claude-code' || explicit === 'openrouter') return explicit;
@@ -50,7 +55,7 @@ function claudeCliPath(): string | null {
 }
 
 const BACKEND: Backend = detectBackend();
-const DEFAULT_EFFORT: Effort = (process.env.ATHENA_EFFORT ?? 'high') as Effort;
+const DEFAULT_EFFORT: Effort = isEffort(process.env.ATHENA_EFFORT) ? process.env.ATHENA_EFFORT : 'high';
 const DEFAULT_MODEL =
   process.env.ATHENA_MODEL ??
   (BACKEND === 'claude-code' ? 'opus' : 'anthropic/claude-opus-4.6');
@@ -325,9 +330,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     throw new Error(`Unknown tool: ${request.params.name}`);
   }
 
-  const args = (request.params.arguments ?? {}) as Partial<ThinkArgs>;
+  const args = (request.params.arguments ?? {}) as Record<string, unknown>;
   if (typeof args.prompt !== 'string' || args.prompt.trim().length === 0) {
     throw new Error('`prompt` is required and must be a non-empty string.');
+  }
+  if (args.effort !== undefined && !isEffort(args.effort)) {
+    throw new Error(`\`effort\` must be one of ${EFFORTS.join(', ')}.`);
   }
 
   try {
