@@ -34,6 +34,9 @@ function isEffort(v: unknown): v is Effort {
   return typeof v === 'string' && (EFFORTS as readonly string[]).includes(v);
 }
 
+// Cache Claude CLI path — don't walk PATH on every call
+let cachedClaudeCli: string | null | undefined;
+
 function detectBackend(): Backend {
   const explicit = process.env.ATHENA_BACKEND?.trim().toLowerCase();
   if (explicit === 'claude-code' || explicit === 'openrouter') return explicit;
@@ -42,29 +45,53 @@ function detectBackend(): Backend {
 }
 
 function claudeCliPath(): string | null {
+  if (cachedClaudeCli !== undefined) return cachedClaudeCli;
   // Only check PATH entries; never shell out to `which` here to avoid a spawn
   // on every server startup. PATH resolution is good enough.
   const override = process.env.ATHENA_CLAUDE_CLI;
-  if (override && existsSync(override)) return override;
+  if (override && existsSync(override)) {
+    cachedClaudeCli = override;
+    return override;
+  }
   const path = process.env.PATH ?? '';
   for (const dir of path.split(':').filter(Boolean)) {
     const candidate = `${dir}/claude`;
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(candidate)) {
+      cachedClaudeCli = candidate;
+      return candidate;
+    }
   }
+  cachedClaudeCli = null;
   return null;
 }
 
 const BACKEND: Backend = detectBackend();
-const DEFAULT_EFFORT: Effort = isEffort(process.env.ATHENA_EFFORT) ? process.env.ATHENA_EFFORT : 'high';
-const DEFAULT_MODEL =
-  process.env.ATHENA_MODEL ??
-  (BACKEND === 'claude-code' ? 'opus' : 'anthropic/claude-opus-4.6');
+
+// Effort-aware model selection
+const DEFAULT_EFFORT = (isEffort(process.env.ATHENA_EFFORT) ? process.env.ATHENA_EFFORT : 'high') as Effort;
+
+const CLAUDE_MODEL_BY_EFFORT: Record<Effort, string> = {
+  low: 'haiku', medium: 'sonnet', high: 'opus',
+};
+const OR_MODEL_BY_EFFORT: Record<Effort, string> = {
+  low: 'anthropic/claude-haiku-4.5',
+  medium: 'anthropic/claude-sonnet-4.6',
+  high: 'anthropic/claude-opus-4.6',
+};
+
+const DEFAULT_MODEL = process.env.ATHENA_MODEL ??
+  (BACKEND === 'claude-code' ? CLAUDE_MODEL_BY_EFFORT[DEFAULT_EFFORT] : OR_MODEL_BY_EFFORT[DEFAULT_EFFORT]);
 
 const APP_NAME = process.env.ATHENA_APP_NAME ?? 'athena-mcp';
 const APP_URL = process.env.ATHENA_APP_URL ?? 'https://github.com/DevvGwardo/athena-mcp';
 
+// Effort-aware timeout
+const TIMEOUT_BY_EFFORT: Record<Effort, number> = {
+  low: 60_000, medium: 180_000, high: 420_000,
+};
+
 // Timeout for claude-code subprocess calls.
-const CLAUDE_TIMEOUT_MS = Number(process.env.ATHENA_TIMEOUT_MS ?? 180_000);
+const CLAUDE_TIMEOUT_MS = Number(process.env.ATHENA_TIMEOUT_MS) || TIMEOUT_BY_EFFORT[DEFAULT_EFFORT];
 
 const SYSTEM_PROMPT = `You are a thinker agent. You have no tools — your sole job is to reason.
 
@@ -111,7 +138,8 @@ async function thinkViaClaudeCode(args: ThinkArgs, userContent: string): Promise
   }
 
   const model = args.model ?? DEFAULT_MODEL;
-  const effort = args.effort ?? DEFAULT_EFFORT;
+  const effort = (args.effort as Effort) ?? DEFAULT_EFFORT;
+  const timeout = Number(process.env.ATHENA_TIMEOUT_MS) || TIMEOUT_BY_EFFORT[effort];
 
   const cliArgs = [
     '-p',
@@ -140,9 +168,10 @@ async function thinkViaClaudeCode(args: ThinkArgs, userContent: string): Promise
     let out = '';
     let err = '';
     const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error(`claude -p timed out after ${CLAUDE_TIMEOUT_MS}ms`));
-    }, CLAUDE_TIMEOUT_MS);
+      child.kill('SIGTERM');
+      setTimeout(() => child.kill('SIGKILL'), 2000).unref();
+      reject(new Error(`claude -p timed out after ${timeout}ms`));
+    }, timeout);
 
     child.stdout.on('data', (c) => { out += c.toString(); });
     child.stderr.on('data', (c) => { err += c.toString(); });
@@ -181,7 +210,10 @@ async function thinkViaClaudeCode(args: ThinkArgs, userContent: string): Promise
     ? ` · ${usage.input_tokens ?? '?'} in / ${usage.output_tokens ?? '?'} out`
     : '';
 
-  return `${cleaned}\n\n---\n_backend: claude-code (subscription) · model: ${model} · effort: ${effort} · ${duration}${tokenInfo}_`;
+  return `${cleaned}
+
+---
+_backend: claude-code (subscription) · model: ${model} · effort: ${effort} · ${duration}${tokenInfo}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +247,8 @@ async function thinkViaOpenRouter(args: ThinkArgs, userContent: string): Promise
   }
 
   const model = args.model ?? DEFAULT_MODEL;
-  const effort = args.effort ?? DEFAULT_EFFORT;
+  const effort = (args.effort as Effort) ?? DEFAULT_EFFORT;
+  const timeout = Number(process.env.ATHENA_TIMEOUT_MS) || TIMEOUT_BY_EFFORT[effort];
 
   const body = {
     model,
@@ -224,7 +257,7 @@ async function thinkViaOpenRouter(args: ThinkArgs, userContent: string): Promise
       { role: 'user', content: userContent },
     ],
     reasoning: { effort },
-    include_reasoning: true,
+    include_reasoning: false, // we suppress reasoning in output anyway — save bandwidth
   };
 
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -236,6 +269,7 @@ async function thinkViaOpenRouter(args: ThinkArgs, userContent: string): Promise
       'X-Title': APP_NAME,
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeout),
   });
 
   if (!res.ok) {
@@ -259,7 +293,10 @@ async function thinkViaOpenRouter(args: ThinkArgs, userContent: string): Promise
     : '';
   const reasoningHint = reasoning ? `\n_(${reasoning.length} chars of reasoning trace suppressed)_` : '';
 
-  return `${cleaned}${reasoningHint}\n\n---\n_backend: openrouter · model: ${data.model ?? model} · effort: ${effort}${tokenInfo}_`;
+  return `${cleaned}${reasoningHint}
+
+---
+_backend: openrouter · model: ${data.model ?? model} · effort: ${effort}${tokenInfo}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +323,7 @@ const modelExamples =
     : 'anthropic/claude-opus-4.6, openai/gpt-5.4, google/gemini-3.1-pro-preview, deepseek/deepseek-r1';
 
 const server = new Server(
-  { name: 'athena-mcp', version: '0.3.0' },
+  { name: 'athena-mcp', version: '0.4.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -340,9 +377,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     const response = await think({
-      prompt: args.prompt,
+      prompt: args.prompt as string,
       context: typeof args.context === 'string' ? args.context : undefined,
-      effort: args.effort,
+      effort: args.effort as Effort,
       model: typeof args.model === 'string' ? args.model : undefined,
     });
     return { content: [{ type: 'text', text: response }] };
